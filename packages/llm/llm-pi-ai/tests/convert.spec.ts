@@ -837,6 +837,12 @@ describe('mapStopReason / mapUsage', () => {
     'OpenAI Responses stream ended before a terminal response event',
     'openrouter stream ended without a terminal event',
     'Stream ended without finish_reason',
+    // OpenAI-compatible gateways that fail their own upstream fetch surface it
+    // as a finish_reason; pi-ai 0.82 renders it verbatim. The `_` spelling
+    // defeats the plain \bnetwork\b alternation (underscore is a word char).
+    'Provider finish_reason: network_error',
+    'gateway said network-error',
+    'gateway said network error',
   ])('maps pi-ai transport wording %j', (errorMessage) => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
       .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })
