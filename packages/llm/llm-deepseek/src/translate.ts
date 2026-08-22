@@ -33,6 +33,14 @@ export function mapFinishReason(reason: string): FinishReason {
     case 'stop': return { kind: 'stop' }
     case 'tool_calls': return { kind: 'tool-calls' }
     case 'length': return { kind: 'max-tokens' }
+    // An OpenAI-compatible gateway reporting its own upstream connection
+    // failure via finish_reason: transient, so map to the retryable TRANSPORT
+    // code instead of the default non-retryable uppercased wire value.
+    case 'network_error': case 'network-error':
+      return {
+        kind: 'error',
+        failure: { message: `model stopped: ${reason}`, code: 'TRANSPORT' },
+      }
     default:
       // content_filter, insufficient_system_resource, future additions.
       return {

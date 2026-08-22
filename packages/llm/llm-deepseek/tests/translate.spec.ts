@@ -279,6 +279,16 @@ describe('mapFinishReason', () => {
       })
     },
   )
+
+  it.each(['network_error', 'network-error'])(
+    'maps %s to the retryable TRANSPORT code',
+    (wire) => {
+      expect(mapFinishReason(wire)).toEqual({
+        kind: 'error',
+        failure: { message: `model stopped: ${wire}`, code: 'TRANSPORT' },
+      })
+    },
+  )
 })
 
 describe('mapUsage', () => {
