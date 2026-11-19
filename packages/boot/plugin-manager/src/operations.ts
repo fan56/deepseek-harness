@@ -84,6 +84,30 @@ export function bundleManifest(name: string, dir: string, anchor: string): Profi
   return manifest.dsh?.bundle?.patch === undefined ? undefined : manifest
 }
 
+/**
+ * The activation hint for a package that declares `dsh.companions`, required
+ * companions first. Nothing is printed for a missing, empty, or malformed
+ * declaration: a companion is another package the user may install, never
+ * something this operation activates on their behalf.
+ * @param manifest An installed package's manifest.
+ * @returns Lines to print on stdout, or undefined when there is nothing to say.
+ */
+export function companionActivationHint(manifest: ProfileManifest): string | undefined {
+  const declared = (manifest as ProfileManifest & { dsh?: { companions?: unknown } }).dsh?.companions
+  if (!Array.isArray(declared)) return undefined
+  const companions = declared.flatMap((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null) return []
+    const { name, description, required } = entry as Record<string, unknown>
+    if (typeof name !== 'string' || name.length === 0) return []
+    return [{ name, description: typeof description === 'string' ? description : '', required: required === true }]
+  }).sort((left, right) => Number(right.required) - Number(left.required))
+  if (companions.length === 0) return undefined
+  const subject = typeof manifest.name === 'string' && manifest.name !== '' ? manifest.name : 'an installed plugin'
+  const lines = companions.map(({ name, description, required }) =>
+    `dsh:   ${required ? '[recommended] ' : ''}${name}${description === '' ? '' : ` — ${description}`} — run: dsh plugin add ${name}\n`)
+  return `dsh: ${subject} declares companion plugins for its full functionality:\n${lines.join('')}`
+}
+
 /** Atomically save a profile manifest while retaining unrelated fields.
  * @param dir Profile directory.
  * @param manifest Updated document.
@@ -258,6 +282,22 @@ async function activeRecordedRun(dir: string): Promise<string | undefined> {
 function directDependencies(manifest: ProfileManifest): Record<string, string> {
   const extra = manifest as ProfileManifest & { devDependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }
   return { ...extra.devDependencies, ...manifest.dependencies, ...extra.optionalDependencies }
+}
+
+/** Companion hints for direct dependencies this run added or changed; unreadable metadata is skipped. */
+function companionInstallHints(before: Readonly<Record<string, string>>, after: ProfileManifest, dir: string): string {
+  const hints: string[] = []
+  for (const [name, spec] of Object.entries(directDependencies(after))) {
+    if (before[name] === spec) continue
+    let manifest: ProfileManifest
+    try { manifest = readProfileManifest('dsh', join(dir, 'node_modules', name)) } catch {
+      // pnpm reported the dependency but its installed metadata cannot be read — nothing to hint about.
+      continue
+    }
+    const hint = companionActivationHint(manifest)
+    if (hint !== undefined) hints.push(hint)
+  }
+  return hints.join('')
 }
 
 /** Inspect only plugin rows contributed by the changed bundle, not its dependency closure. */
@@ -563,14 +603,25 @@ export async function runProfilePnpm(
         await log.write(diagnostic)
         options.onOutput?.(diagnostic, 'stderr')
         append(Buffer.from(diagnostic))
-      } else if (options.activateNewBundles !== false) {
-        const unsupported = await reconcile(before, dir, context.installAnchor, options)
-        if (unsupported.length > 0) {
-          exitCode = 1
-          const diagnostic = `\ndsh: bundle activation rejected: ${unsupported.join('\n')}\ndsh: installed dependencies remain; bundle selection is unchanged. Use a supported Host or remove the unwanted dependencies with 'dsh plugin remove <package>'.\n`
-          await log.write(diagnostic)
-          options.onOutput?.(diagnostic, 'stderr')
-          append(Buffer.from(diagnostic))
+      } else {
+        if (options.activateNewBundles !== false) {
+          const unsupported = await reconcile(before, dir, context.installAnchor, options)
+          if (unsupported.length > 0) {
+            exitCode = 1
+            const diagnostic = `\ndsh: bundle activation rejected: ${unsupported.join('\n')}\ndsh: installed dependencies remain; bundle selection is unchanged. Use a supported Host or remove the unwanted dependencies with 'dsh plugin remove <package>'.\n`
+            await log.write(diagnostic)
+            options.onOutput?.(diagnostic, 'stderr')
+            append(Buffer.from(diagnostic))
+          }
+        }
+        // On full success only: a stdout hint that neither activates companions nor
+        // changes this operation's result. Activation failures print diagnostics instead.
+        if (exitCode === 0) {
+          const hints = companionInstallHints(beforeDependencies, after, dir)
+          if (hints !== '') {
+            options.onOutput?.(hints, 'stdout')
+            append(Buffer.from(hints))
+          }
         }
       }
     }

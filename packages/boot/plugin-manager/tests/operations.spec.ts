@@ -5,8 +5,8 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { PassThrough } from 'node:stream'
 import { expect, it, onTestFinished, vi } from 'vitest'
-import { getDshRuntimeVersion, initProfile, readProfileManifest } from '@deepseek-ai/dsh-app-boot'
-import { anchorPathSpec, readProfileRegistry, runPluginCommand, runProfilePnpm, viewProfilePackage } from '../src/operations.ts'
+import { getDshRuntimeVersion, initProfile, readProfileManifest, type ProfileManifest } from '@deepseek-ai/dsh-app-boot'
+import { anchorPathSpec, companionActivationHint, readProfileRegistry, runPluginCommand, runProfilePnpm, viewProfilePackage } from '../src/operations.ts'
 
 /** The manifest fields an inspection prints. */
 const VIEW_FIELDS = ['name', 'version', 'description', 'dsh'] as const
@@ -1110,4 +1110,95 @@ it('uses application-owned executable arguments and environment for package oper
   expect(command.run).toHaveBeenLastCalledWith(runtime.command,
     [...runtime.args, 'view', 'example', 'name', 'version', 'description', 'dsh', '--json', '--config.fetch-retries=0'],
     expect.objectContaining({ env: expect.objectContaining(runtime.env) as unknown }))
+})
+
+/** A package manifest with a companion declaration, as read from its installed package.json. */
+function companionManifest(companions: unknown, name = 'host'): ProfileManifest {
+  return { name, dsh: { companions } } as ProfileManifest
+}
+
+it('renders declared companions on stdout with required ones first and ignores malformed entries', () => {
+  const hint = companionActivationHint(companionManifest([
+    { name: 'optional', description: 'Optional extra.', required: false },
+    { name: 'recommended', description: 'Core add-on.', required: true },
+    { name: 'no-description', required: true },
+    null,
+    { description: 'nameless' },
+    'not an object',
+  ], '@scope/host'))
+  expect(hint?.startsWith('dsh: @scope/host declares companion plugins for its full functionality:\n')).toBe(true)
+  expect(hint?.split('\n').slice(1, 4)).toEqual([
+    'dsh:   [recommended] recommended — Core add-on. — run: dsh plugin add recommended',
+    'dsh:   [recommended] no-description — run: dsh plugin add no-description',
+    'dsh:   optional — Optional extra. — run: dsh plugin add optional',
+  ])
+  expect(hint).not.toContain('nameless')
+})
+
+it('stays silent for a missing, empty, or unusable companions declaration', () => {
+  expect(companionActivationHint(companionManifest(undefined))).toBeUndefined()
+  expect(companionActivationHint(companionManifest([]))).toBeUndefined()
+  expect(companionActivationHint(companionManifest('nope'))).toBeUndefined()
+  expect(companionActivationHint(companionManifest([null, { description: 'nameless' }]))).toBeUndefined()
+})
+
+/** Install a bundle whose manifest declares the given companions. */
+function installCompanionHost(dir: string, companions: unknown) {
+  install(dir, 'host')
+  const path = join(dir, 'node_modules', 'host', 'package.json')
+  const manifest = JSON.parse(readFileSync(path, 'utf8')) as { dsh: Record<string, unknown> }
+  manifest.dsh.companions = companions
+  writeFileSync(path, JSON.stringify(manifest))
+}
+
+it('prints companion activation hints on stdout after a successful add, without touching activation', async () => {
+  const { dir, context, pnpm } = fixture()
+  pnpm.mutate = (target) => {
+    installCompanionHost(target, [
+      { name: 'optional-companion', description: 'Optional add-on.', required: false },
+      { name: 'recommended-companion', description: 'Recommended add-on.', required: true },
+    ])
+  }
+  const messages: { text: string; stream: 'stdout' | 'stderr' }[] = []
+  const result = await runPluginCommand(context, ['add', 'host'], {
+    execution: 'service', outputBytes: 8192, onOutput: (text, stream) => { messages.push({ text, stream }) },
+  })
+  const stdout = messages.filter(message => message.stream === 'stdout').map(message => message.text).join('')
+  const stderr = messages.filter(message => message.stream === 'stderr').map(message => message.text).join('')
+  expect(result.exitCode).toBe(0)
+  expect(stdout).toContain('host declares companion plugins')
+  expect(stdout.indexOf('recommended-companion')).toBeLessThan(stdout.indexOf('optional-companion'))
+  expect(stdout).toContain('run: dsh plugin add recommended-companion')
+  expect(stderr).not.toContain('companion')
+  expect(result.output).toContain('dsh plugin add optional-companion')
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['host'])
+})
+
+it('prints no companion hint when the installed package declares none', async () => {
+  const { context, pnpm } = fixture()
+  pnpm.mutate = (target) => { install(target, 'host') }
+  const messages: string[] = []
+  const result = await runPluginCommand(context, ['add', 'host'], {
+    execution: 'service', outputBytes: 8192, onOutput: (text) => { messages.push(text) },
+  })
+  expect(result.exitCode).toBe(0)
+  expect(messages.join('')).not.toContain('companion')
+  expect(result.output).not.toContain('companion')
+})
+
+it('prints the companion hint even when bundle activation is disabled, and not when the install fails', async () => {
+  const { context, pnpm } = fixture()
+  pnpm.mutate = (target) => { installCompanionHost(target, [{ name: 'companion', description: 'Add-on.', required: true }]) }
+  const enabled: string[] = []
+  await runPluginCommand(context, ['add', 'host'], {
+    execution: 'service', outputBytes: 8192, activateNewBundles: false, onOutput: (text) => { enabled.push(text) },
+  })
+  expect(enabled.join('')).toContain('dsh plugin add companion')
+  pnpm.exitCode = 1
+  const failed: string[] = []
+  const result = await runPluginCommand(context, ['add', 'host'], {
+    execution: 'service', outputBytes: 8192, onOutput: (text) => { failed.push(text) },
+  })
+  expect(result.exitCode).toBe(1)
+  expect(failed.join('')).not.toContain('companion')
 })
