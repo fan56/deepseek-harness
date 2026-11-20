@@ -8,7 +8,7 @@
   - text: Subagent run stopped
   - time: {{clock}}
 - paragraph: This notification triggered this response.
-- text: Background subagent agent-1 was stopped before it finished.Its closing message:## Research result The original child reply stays available.
+- text: The user stopped "agent-1" before it finished. Do not resume or re-dispatch its work unless the user asks.Its closing message:## Research result The original child reply stays available.
 
 - button "Subagent run failed {{clock}}" [expanded]:
   - text: Subagent run failed
