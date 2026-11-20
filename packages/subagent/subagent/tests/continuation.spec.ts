@@ -3283,7 +3283,7 @@ describe('continuable settlement delivery', () => {
     // task had finished.
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIts closing message:\nthe answer`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIts closing message:\nthe answer`,
     )
   })
 
@@ -3309,7 +3309,7 @@ describe('continuable settlement delivery', () => {
     // that genuinely finished with no output.
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
   })
 
@@ -3335,7 +3335,7 @@ describe('continuable settlement delivery', () => {
 
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
   })
 
@@ -3372,7 +3372,7 @@ describe('continuable settlement delivery', () => {
     expect(hasUserText(child.session.snapshotEvents(), 'never runs')).toBe(false)
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIts closing message:\nthe answer`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIts closing message:\nthe answer`,
     )
   })
 
@@ -3431,12 +3431,51 @@ describe('continuable settlement delivery', () => {
     await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
 
     // The notice lands in the next-turn inbox but must not open a new turn:
-    // reading "was stopped before it finished" would re-dispatch the stopped work.
+    // waking the parent here would let it re-dispatch the work the user stopped.
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'aborted' })
     expect(parent.inbox.nextTurn).toHaveLength(1)
     expect(turnStarts).toEqual([])
     expect(parent.status).toBe('idle')
+  })
+
+  it('reclaims a busy parent aborted notice only at the next turn boundary', async () => {
+    const releaseChild = Promise.withResolvers<undefined>()
+    const releaseParent = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([
+      { chunks: textResponse('parent works'), gate: releaseParent.promise },
+      { chunks: textResponse('interrupted'), gate: releaseChild.promise },
+      { chunks: textResponse('parent reacts') },
+    ])
+    const { ctx, parent } = await setupWith(adapter)
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    // Open a parent turn first so it is mid-turn when the child aborts.
+    parent.followup(createUserMessage({ content: message('start working'), source: { kind: 'user' } }))
+    await vi.waitFor(() => { expect(parent.status).toBe('running') })
+
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+    ctx.subagents.interrupt(started.childId, { kind: 'user' })
+    releaseChild.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
+
+    // Wake suppression keeps the notice in next-turn while the parent is busy;
+    // it does not open a new turn or enter the current turn's step queue.
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'aborted' })
+    expect(parent.inbox.nextTurn).toHaveLength(1)
+    expect(parent.inbox.nextStep).toHaveLength(0)
+    expect(turnStarts).toEqual([1])
+
+    // 已知局限：busy 场景 wake 抑制只作用于 wakeDriver，turn 边界 hasPending 续开仍会发生——见 PR 描述 known limitation
+    releaseParent.resolve(undefined)
+    await vi.waitFor(() => { expect(turnStarts).toEqual([1, 2]) })
+    expect(parent.inbox.nextTurn).toHaveLength(0)
+    expect(settlementNotices(parent)).toHaveLength(1)
   })
 
   it('wakes an idle parent for a completed settlement notice', async () => {
@@ -3488,7 +3527,7 @@ describe('continuable settlement delivery', () => {
     expect(notice.stopReason).toBe('error')
     expect(notice.reminder).toBe(
       '<system-reminder>\n'
-      + `Subagent "${started.name}" finished (error). If any todo items track this work, call todo_write now to update their status.\n`
+      + `Subagent "${started.name}" failed (error). If any todo items track this work, call todo_write now to mark them blocked or failed.\n`
       + '</system-reminder>',
     )
   })
@@ -3565,7 +3604,7 @@ describe('continuable settlement delivery', () => {
     // message when that parent is disposed next is pinned by the test below.
     expect(settlementNotices(parent)).toHaveLength(1)
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
     expect(parent.session.snapshotEvents().some(event => event.type === 'agent/inbox/spliced')).toBe(true)
     expect(parent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)

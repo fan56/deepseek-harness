@@ -111,7 +111,7 @@ function settlementSummary(childName: string, stopReason: SubagentResult['stopRe
         ? `${subject} finished and will do no further work unless you send it more.`
         : `${subject} finished. It cannot receive follow-up messages.`
     case 'aborted':
-      return `${subject} was stopped before it finished.`
+      return `The user stopped "${childName}" before it finished. Do not resume or re-dispatch its work unless the user asks.`
     case 'max-tokens':
       return `${subject} ran out of room before it finished.`
     // A pre-step rejection — a hook deny, a policy plugin — discarded input
@@ -142,9 +142,12 @@ export function settlementTodoReminder(
 ): string | undefined {
   if (stopReason !== 'completed' && stopReason !== 'error') return undefined
   const label = childName.replaceAll('</system-reminder>', '<\\/system-reminder>')
+  const guidance = stopReason === 'error'
+    ? `Subagent "${label}" failed (${stopReason}). If any todo items track this work, call todo_write now to mark them blocked or failed.`
+    : `Subagent "${label}" finished (${stopReason}). If any todo items track this work, call todo_write now to update their status.`
   return [
     '<system-reminder>',
-    `Subagent "${label}" finished (${stopReason}). If any todo items track this work, call todo_write now to update their status.`,
+    guidance,
     '</system-reminder>',
   ].join('\n')
 }
