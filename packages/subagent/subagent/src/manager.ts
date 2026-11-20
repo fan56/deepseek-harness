@@ -1131,6 +1131,7 @@ export class SubagentManager {
       const message = createSettlementMessage(
         activation.childId, agentAddress(activation.path, activation.childId), terminal,
         activation.kind === 'local', activation.kind === 'local' && activation.omitClosingText,
+        terminal.stopReason === 'completed' || terminal.stopReason === 'error',
       )
       if (this.closingTeardownFor(parent) !== undefined) {
         parent.inject(message)
