@@ -111,7 +111,7 @@ function settlementSummary(childName: string, stopReason: SubagentResult['stopRe
         ? `${subject} finished and will do no further work unless you send it more.`
         : `${subject} finished. It cannot receive follow-up messages.`
     case 'aborted':
-      return `${subject} was stopped before it finished.`
+      return `The user stopped "${childName}" before it finished. Do not resume or re-dispatch its work unless the user asks.`
     case 'max-tokens':
       return `${subject} ran out of room before it finished.`
     // A pre-step rejection — a hook deny, a policy plugin — discarded input
@@ -129,6 +129,30 @@ function settlementSummary(childName: string, stopReason: SubagentResult['stopRe
 }
 
 /**
+ * A structured model-visible reminder that the parent refresh its todo list
+ * after a child finishes. Only completed and error endings earn one: an aborted
+ * child is enqueued without waking the parent and must not provoke bookkeeping.
+ * @param childName - model-facing child name used in the reminder text.
+ * @param stopReason - how the child's last ordinary turn ended.
+ * @returns the framed system-reminder block, or undefined when no reminder applies.
+ */
+export function settlementTodoReminder(
+  childName: string,
+  stopReason: SubagentResult['stopReason'],
+): string | undefined {
+  if (stopReason !== 'completed' && stopReason !== 'error') return undefined
+  const label = childName.replaceAll('</system-reminder>', '<\\/system-reminder>')
+  const guidance = stopReason === 'error'
+    ? `Subagent "${label}" failed (${stopReason}). If any todo items track this work, call todo_write now to mark them blocked or failed.`
+    : `Subagent "${label}" finished (${stopReason}). If any todo items track this work, call todo_write now to update their status.`
+  return [
+    '<system-reminder>',
+    guidance,
+    '</system-reminder>',
+  ].join('\n')
+}
+
+/**
  * Build the runtime-owned settlement notice from the child's nonempty closing text.
  * @param childId - durable child session id recorded as the sender.
  * @param childName - model-facing child name used in the notice text.
@@ -136,6 +160,8 @@ function settlementSummary(childName: string, stopReason: SubagentResult['stopRe
  * @param continuable - whether the child can accept another task.
  * @param omitClosingText - replace the closing text when the child's last action
  *   was a message to its direct parent.
+ * @param includeTodoReminder - append the structured todo reminder for endings
+ *   that wake the parent; delivery decides when the notice reaches a live parent.
  * @returns the durable user-message representation delivered to the parent.
  */
 export function createSettlementMessage(
@@ -144,8 +170,10 @@ export function createSettlementMessage(
   terminal: SubagentResult,
   continuable = true,
   omitClosingText = false,
+  includeTodoReminder = false,
 ): ReturnType<typeof createUserMessage> {
   const summary = settlementSummary(childName, terminal.stopReason, continuable)
+  const reminder = includeTodoReminder ? settlementTodoReminder(childName, terminal.stopReason) : undefined
   // Parent providers receive this notice as a user message and may reject
   // nontext assistant blocks. Keep this conversion local so SDK/UI consumers
   // retain the complete child output.
@@ -164,6 +192,7 @@ export function createSettlementMessage(
         ? [{ type: 'text' as const, text: `Structured result: ${JSON.stringify(terminal.structured)}` }] : [],
       ...terminal.diagnostic !== undefined
         ? [{ type: 'text' as const, text: terminal.diagnostic }] : [],
+      ...reminder !== undefined ? [{ type: 'text' as const, text: reminder }] : [],
     ],
     source: {
       kind: 'subagent-settled' as const,

@@ -388,7 +388,7 @@ it.each(['completed', 'aborted'] as const)('reports external %s without offering
   backend.result.resolve({ output: [], stopReason })
   backend.cleanup.resolve(undefined)
   await activation.dispose()
-  expect(JSON.stringify(fixture.parent.inbox.nextTurn)).toContain(stopReason === 'completed' ? 'cannot receive follow-up messages' : 'was stopped before it finished')
+  expect(JSON.stringify(fixture.parent.inbox.nextTurn)).toContain(stopReason === 'completed' ? 'cannot receive follow-up messages' : 'Do not resume or re-dispatch its work unless the user asks.')
   expect(JSON.stringify(fixture.parent.inbox.nextTurn)).not.toContain('send it more')
 })
 

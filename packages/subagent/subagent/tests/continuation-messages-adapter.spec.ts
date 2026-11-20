@@ -83,6 +83,12 @@ it('continues the parent through default Messages after a reasoning-bearing cont
       { type: 'text', text: 'Background subagent agent-1 finished and will do no further work unless you send it more.' },
       { type: 'text', text: 'Its closing message:' },
       { type: 'text', text: 'child answer' },
+      {
+        type: 'text',
+        text: '<system-reminder>\n'
+          + 'Subagent "agent-1" finished (completed). If any todo items track this work, call todo_write now to update their status.\n'
+          + '</system-reminder>',
+      },
     ]
     expect(notice?.content).toEqual(closingContent)
     expect(notice?.source).toMatchObject({

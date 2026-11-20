@@ -2869,11 +2869,14 @@ function settlementNotices(agent: Agent) {
   const logged = agent.session.snapshotEvents().flatMap(event => event.type === 'user/message' ? [event.data] : [])
   return [...logged, ...agent.inbox.nextStep, ...agent.inbox.nextTurn].flatMap((message) => {
     if (message.source.kind !== 'subagent-settled') return []
+    const blocks = message.content.flatMap(block => block.type === 'text' ? [block.text] : [])
+    const reminder = blocks.find(block => block.startsWith('<system-reminder>'))
     return [{
       sender: message.source.senderSessionId,
       summary: message.source.summary,
       stopReason: message.source.stopReason,
-      text: message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'),
+      text: blocks.filter(block => block !== reminder).join('\n'),
+      reminder,
     }]
   })
 }
@@ -3280,7 +3283,7 @@ describe('continuable settlement delivery', () => {
     // task had finished.
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIts closing message:\nthe answer`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIts closing message:\nthe answer`,
     )
   })
 
@@ -3306,7 +3309,7 @@ describe('continuable settlement delivery', () => {
     // that genuinely finished with no output.
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
   })
 
@@ -3332,7 +3335,7 @@ describe('continuable settlement delivery', () => {
 
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
   })
 
@@ -3369,7 +3372,7 @@ describe('continuable settlement delivery', () => {
     expect(hasUserText(child.session.snapshotEvents(), 'never runs')).toBe(false)
     await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIts closing message:\nthe answer`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIts closing message:\nthe answer`,
     )
   })
 
@@ -3410,6 +3413,140 @@ describe('continuable settlement delivery', () => {
       expect(adapter.requests.filter(request => request.sessionId === parent.id)).toHaveLength(1)
     })
     expect(turnStarts).toEqual([1])
+  })
+
+  it('queues an aborted settlement notice without waking an idle parent', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([{ chunks: textResponse('interrupted'), gate: release.promise }])
+    const { ctx, parent } = await setupWith(adapter)
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+    ctx.subagents.interrupt(started.childId, { kind: 'user' })
+    release.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
+
+    // The notice lands in the next-turn inbox but must not open a new turn:
+    // waking the parent here would let it re-dispatch the work the user stopped.
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'aborted' })
+    expect(parent.inbox.nextTurn).toHaveLength(1)
+    expect(turnStarts).toEqual([])
+    expect(parent.status).toBe('idle')
+  })
+
+  it('reclaims a busy parent aborted notice only at the next turn boundary', async () => {
+    const releaseChild = Promise.withResolvers<undefined>()
+    const releaseParent = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([
+      { chunks: textResponse('parent works'), gate: releaseParent.promise },
+      { chunks: textResponse('interrupted'), gate: releaseChild.promise },
+      { chunks: textResponse('parent reacts') },
+    ])
+    const { ctx, parent } = await setupWith(adapter)
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    // Open a parent turn first so it is mid-turn when the child aborts.
+    parent.followup(createUserMessage({ content: message('start working'), source: { kind: 'user' } }))
+    await vi.waitFor(() => { expect(parent.status).toBe('running') })
+
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+    ctx.subagents.interrupt(started.childId, { kind: 'user' })
+    releaseChild.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
+
+    // Wake suppression keeps the notice in next-turn while the parent is busy;
+    // it does not open a new turn or enter the current turn's step queue.
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'aborted' })
+    expect(parent.inbox.nextTurn).toHaveLength(1)
+    expect(parent.inbox.nextStep).toHaveLength(0)
+    expect(turnStarts).toEqual([1])
+
+    // 已知局限：busy 场景 wake 抑制只作用于 wakeDriver，turn 边界 hasPending 续开仍会发生——见 PR 描述 known limitation
+    releaseParent.resolve(undefined)
+    await vi.waitFor(() => { expect(turnStarts).toEqual([1, 2]) })
+    expect(parent.inbox.nextTurn).toHaveLength(0)
+    expect(settlementNotices(parent)).toHaveLength(1)
+  })
+
+  it('wakes an idle parent for a completed settlement notice', async () => {
+    const { ctx, parent, adapter } = await setup([textResponse('the answer'), textResponse('parent ack')])
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'completed' })
+    await vi.waitFor(() => {
+      expect(adapter.requests.filter(request => request.sessionId === parent.id)).toHaveLength(1)
+    })
+    expect(settlementNotices(parent)).toHaveLength(1)
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'completed' })
+    expect(turnStarts).toEqual([1])
+  })
+
+  it('adds a todo reminder to a completed settlement notice', async () => {
+    const { ctx, parent } = await setup([textResponse('the answer'), textResponse('parent ack')])
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await waitNoActivation(ctx, started.childId)
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    const notice = settlementNotices(parent)[0]!
+    expect(notice.stopReason).toBe('completed')
+    expect(notice.reminder).toBe(
+      '<system-reminder>\n'
+      + `Subagent "${started.name}" finished (completed). If any todo items track this work, call todo_write now to update their status.\n`
+      + '</system-reminder>',
+    )
+    expect(notice.text).not.toContain('todo_write')
+  })
+
+  it('adds a todo reminder to an error settlement notice', async () => {
+    const { ctx, parent } = await setup([textResponse('child answer'), textResponse('parent ack')])
+    ctx.on('session/event', (session, event) => {
+      if (session === parent.session || event.type !== 'turn/end') return
+      const child = ctx.agents.get(session.id)
+      if (child === undefined) return
+      agentEvents(ctx, child).emit('agent/error', {
+        turn: event.data.turn, step: 0, error: new Error('child failed'),
+      })
+    }, { prepend: true })
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await waitNoActivation(ctx, started.childId)
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    const notice = settlementNotices(parent)[0]!
+    expect(notice.stopReason).toBe('error')
+    expect(notice.reminder).toBe(
+      '<system-reminder>\n'
+      + `Subagent "${started.name}" failed (error). If any todo items track this work, call todo_write now to mark them blocked or failed.\n`
+      + '</system-reminder>',
+    )
+  })
+
+  it('omits the todo reminder from an aborted settlement notice', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([{ chunks: textResponse('interrupted'), gate: release.promise }])
+    const { ctx, parent } = await setupWith(adapter)
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+    ctx.subagents.interrupt(started.childId, { kind: 'user' })
+    release.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    const notice = settlementNotices(parent)[0]!
+    expect(notice.stopReason).toBe('aborted')
+    expect(notice.reminder).toBeUndefined()
+    expect(notice.text).not.toContain('<system-reminder>')
   })
 
   it('batches simultaneous notices into one step of a busy parent', async () => {
@@ -3467,7 +3604,7 @@ describe('continuable settlement delivery', () => {
     // message when that parent is disposed next is pinned by the test below.
     expect(settlementNotices(parent)).toHaveLength(1)
     expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} was stopped before it finished.\nIt left no closing message.`,
+      `The user stopped "${started.name}" before it finished. Do not resume or re-dispatch its work unless the user asks.\nIt left no closing message.`,
     )
     expect(parent.session.snapshotEvents().some(event => event.type === 'agent/inbox/spliced')).toBe(true)
     expect(parent.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
