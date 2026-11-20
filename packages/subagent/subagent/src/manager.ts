@@ -1136,6 +1136,15 @@ export class SubagentManager {
         parent.inject(message)
         return
       }
+      // A user-stopped child does not earn a new host turn: waking the host here
+      // lets it read this notice and re-dispatch the work the user just stopped.
+      // Queue the notice for the next real interaction instead. A resident
+      // subagent parent keeps the original wake so it can drain the notice and
+      // settle; suppressing that wake would strand it in its inbox forever.
+      if (terminal.stopReason === 'aborted' && this.resident.get(parent.id) === undefined) {
+        parent.send(message, 'next-turn', false)
+        return
+      }
       this.sendWaking(parent, message, parent.status === 'idle' ? 'queue' : 'steer')
     } catch (error: unknown) {
       this.ctx.logger.warn(

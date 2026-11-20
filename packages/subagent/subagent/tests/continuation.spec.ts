@@ -3412,6 +3412,47 @@ describe('continuable settlement delivery', () => {
     expect(turnStarts).toEqual([1])
   })
 
+  it('queues an aborted settlement notice without waking an idle parent', async () => {
+    const release = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([{ chunks: textResponse('interrupted'), gate: release.promise }])
+    const { ctx, parent } = await setupWith(adapter)
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+    ctx.subagents.interrupt(started.childId, { kind: 'user' })
+    release.resolve(undefined)
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'aborted' })
+
+    // The notice lands in the next-turn inbox but must not open a new turn:
+    // reading "was stopped before it finished" would re-dispatch the stopped work.
+    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'aborted' })
+    expect(parent.inbox.nextTurn).toHaveLength(1)
+    expect(turnStarts).toEqual([])
+    expect(parent.status).toBe('idle')
+  })
+
+  it('wakes an idle parent for a completed settlement notice', async () => {
+    const { ctx, parent, adapter } = await setup([textResponse('the answer'), textResponse('parent ack')])
+    const turnStarts: number[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session.id === parent.id && event.type === 'turn/start') turnStarts.push(event.data.turn)
+    })
+    const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+    await waitNoActivation(ctx, started.childId)
+    await expect(started.result).resolves.toMatchObject({ stopReason: 'completed' })
+    await vi.waitFor(() => {
+      expect(adapter.requests.filter(request => request.sessionId === parent.id)).toHaveLength(1)
+    })
+    expect(settlementNotices(parent)).toHaveLength(1)
+    expect(settlementNotices(parent)[0]).toMatchObject({ sender: started.childId, stopReason: 'completed' })
+    expect(turnStarts).toEqual([1])
+  })
+
   it('batches simultaneous notices into one step of a busy parent', async () => {
     const releaseChildren = Promise.withResolvers<undefined>()
     const releaseParent = Promise.withResolvers<undefined>()
